@@ -26,6 +26,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+
+	<!-- App Transport Security -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
@@ -33,22 +35,54 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+
+	<!-- Location -->
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string></string>
+	<string>GPMS needs access to your location while using the app to provide location-based services.</string>
+
+	<!-- Camera -->
+	<key>NSCameraUsageDescription</key>
+	<string>GPMS needs access to your camera to capture photos and scan documents.</string>
+
+	<!-- Microphone / Record Audio -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>GPMS needs access to your microphone to record audio when required.</string>
+
+	<!-- Photos / Media / External storage equivalent -->
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>GPMS needs access to your photo library to let you select and upload photos.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>GPMS needs permission to save photos and files to your library.</string>
+
+	<!-- Biometrics / Face ID -->
+	<key>NSFaceIDUsageDescription</key>
+	<string>GPMS uses Face ID to securely authenticate you.</string>
+
+	<!-- (Optional) If you ever use tracking / IDFA via AppTrackingTransparency -->
+	<!--
+	<key>NSUserTrackingUsageDescription</key>
+	<string>GPMS uses your identifier to provide a better and more personalized experience.</string>
+	-->
+
+	<!-- React Native New Architecture flag -->
 	<key>RCTNewArchEnabled</key>
 	<true/>
+
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
+
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>
 	</array>
+
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<false/>
 </dict>
