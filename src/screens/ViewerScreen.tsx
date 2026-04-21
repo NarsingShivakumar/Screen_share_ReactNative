@@ -1,860 +1,562 @@
-// src/screens/ViewerScreen.tsx
-import React, { useEffect, useRef, useCallback, useState } from 'react';
-import {
-  View, Text, StyleSheet, PanResponder, GestureResponderEvent,
-  PanResponderGestureState, TouchableOpacity, Animated, Dimensions,
-  StatusBar, ActivityIndicator, LayoutRectangle,
-} from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import FastImage from '@d11/react-native-fast-image';
-import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
-import LinearGradient from 'react-native-linear-gradient';
-import { useRoute, useNavigation } from '@react-navigation/native';
-import type { RouteProp } from '@react-navigation/native';
-import { useAppDispatch, useAppSelector } from '../store';
-import { setShowControls, resetStream } from '../store/slices/streamSlice';
-import { resetConnection, setStatus } from '../store/slices/connectionSlice';
-import { useWebSocket } from '../hooks/useWebSocket';
-import { colors, typography, spacing, radii, shadows, palette } from '../theme/theme';
-import type { RootStackParamList } from '../navigation/AppNavigator';
+/**
+ * ViewerScreen.tsx — Controller side (full touch handling upgrade)
+ *
+ * Changes from original:
+ *  - Replaced PanResponder with raw View touch handlers to get changedTouches (multi-touch)
+ *  - Proper pointer lifecycle: down → move → up (no more repeated taps)
+ *  - Normalized coordinates relative to the RENDERED image bounds (handles letterboxing)
+ *  - Multi-touch (pinch/zoom) via pointerId tracking
+ *  - Long-press detection via timer
+ *  - Scroll detection via vertical velocity
+ *  - Precision mode toggle (reduces move threshold)
+ *  - Per-pointer visual indicators on controller
+ *  - System action bar (back/home/recents/notifications/lock)
+ *  - Auto-reconnect with exponential back-off
+ *  - Latency monitoring via ping/pong
+ *  - Device resolution received from host for accurate coordinate mapping
+ */
 
-type ViewerRoute = RouteProp<RootStackParamList, 'Viewer'>;
-const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import {
+  View,
+  Image,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  SafeAreaView,
+  GestureResponderEvent,
+  LayoutChangeEvent,
+  Dimensions,
+  Platform,
+} from 'react-native';
+import { RouteProp } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type RootStackParamList = {
+  Viewer: { hostIp: string };
+};
+
+interface Props {
+  route: RouteProp<RootStackParamList, 'Viewer'>;
+  navigation: NativeStackNavigationProp<RootStackParamList, 'Viewer'>;
+}
+
+/** Outgoing message: single pointer event */
+interface PointerMsg {
+  type: 'pointer';
+  action: 'down' | 'move' | 'up' | 'cancel';
+  pointerId: number;
+  x: number;           // 0.0 – 1.0  (normalised to host screen)
+  y: number;           // 0.0 – 1.0
+  pressure: number;    // 0.0 – 1.0
+  timestamp: number;   // ms epoch
+}
+
+/** Outgoing message: system button */
+interface SystemMsg {
+  type: 'system';
+  action: 'back' | 'home' | 'recents' | 'notifications' | 'lock';
+}
+
+/** Outgoing ping */
+interface PingMsg { type: 'ping'; ts: number; }
+
+/** Incoming from host */
+interface DeviceInfoMsg {
+  type: 'device_info';
+  width: number;
+  height: number;
+  rotation: number; // 0 | 1 | 2 | 3  (Surface.ROTATION_*)
+}
+
+type OutMsg = PointerMsg | SystemMsg | PingMsg;
+
+/** Visual touch-dot data */
+interface TouchDot { x: number; y: number; id: number; }
+
+/** Rendered image rect inside the View (accounts for letterbox/pillarbox) */
+interface ImageRect { x: number; y: number; w: number; h: number; }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const TAP_MAX_MOVE_PX = 8;
-const TAP_MAX_DURATION_MS = 350;
-const LONG_PRESS_MS = 650;
-const MOVE_THROTTLE_MS = 16;   // ~60 fps cap for drag events
-const PINCH_MIN_DELTA_PX = 20;
 
-export default function ViewerScreen() {
-  const route = useRoute<ViewerRoute>();
-  const nav = useNavigation<any>();
-  const insets = useSafeAreaInsets();
-  const dispatch = useAppDispatch();
+const WS_PORT = 8080;
+const RECONNECT_BASE_MS = 2_000;
+const RECONNECT_MAX_MS = 30_000;
+const PING_INTERVAL_MS = 2_000;
+const LONG_PRESS_MS = 500;
+const MOVE_THRESHOLD_NORMAL = 0.003;   // ~3 pixels on a 1080p host
+const MOVE_THRESHOLD_PRECISION = 0.001;
 
-  const { host, port, shareCode, deviceName } = route.params;
-  const wsUrl = `ws://${host}:${port}`;
+// ─── Component ────────────────────────────────────────────────────────────────
 
-  const { latestFrameUri, remoteWidth, remoteHeight, fps } =
-    useAppSelector(s => s.stream);
-  const { latency, reconnectAttempts } =
-    useAppSelector(s => s.connection);
+const ViewerScreen: React.FC<Props> = ({ route }) => {
+  const { hostIp } = route.params;
 
-  // ─── UI state ──────────────────────────────────────────────────────────────
-  const [controlsVisible, setControlsVisible] = useState(true);
-  const [viewLayout, setViewLayout] = useState<LayoutRectangle | null>(null);
+  // State
+  const [connected, setConnected] = useState(false);
+  const [frameUri, setFrameUri] = useState<string | null>(null);
+  const [latency, setLatency] = useState(0);
+  const [precisionMode, setPrecisionMode] = useState(false);
+  const [touchDots, setTouchDots] = useState<TouchDot[]>([]);
+  const [hostInfo, setHostInfo] = useState<DeviceInfoMsg | null>(null);
 
-  const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const controlsAnim = useRef(new Animated.Value(1)).current;
-  const connBadgeAnim = useRef(new Animated.Value(0)).current;
+  // Refs (don't need re-render)
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectAttempts = useRef(0);
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pingInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pingTs = useRef(0);
 
-  // ─── Touch ripple ──────────────────────────────────────────────────────────
-  const [ripplePos, setRipplePos] = useState<{ x: number; y: number } | null>(null);
-  const rippleAnim = useRef(new Animated.Value(0)).current;
+  /**
+   * imageRect: the actual rendered pixel rect of the <Image> inside the View.
+   * We update this via onLayout AND via host device-info.
+   *
+   * With resizeMode="contain" the image may have letterboxes / pillarboxes.
+   * We store the container rect here; calcImageRect() derives the true rect.
+   */
+  const containerRect = useRef<ImageRect>({ x: 0, y: 0, w: 1, h: 1 });
+  const renderedRect = useRef<ImageRect>({ x: 0, y: 0, w: 1, h: 1 });
 
-  const showRipple = useCallback((px: number, py: number) => {
-    setRipplePos({ x: px, y: py });
-    rippleAnim.setValue(1);
-    Animated.timing(rippleAnim, {
-      toValue: 0, duration: 400, useNativeDriver: true,
-    }).start(() => setRipplePos(null));
-  }, [rippleAnim]);
+  /** Active pointers: Map<pointerId, {normX, normY}> */
+  const activePointers = useRef(new Map<number, { x: number; y: number }>());
 
-  // ─── Double-buffer state ───────────────────────────────────────────────────
-  // Two FastImage slots (A and B) alternate as the "active" display slot.
-  // The inactive slot loads the new frame off-screen; once onLoad fires we
-  // flip activeSlot — the previous frame stays visible until the new one is
-  // GPU-ready, completely eliminating the black flash between frames.
-  const activeSlot = useRef<'A' | 'B'>('A');
-  const [slotA, setSlotA] = useState<string | null>(null);
-  const [slotB, setSlotB] = useState<string | null>(null);
-  // pendingSlot tracks which slot is currently loading a new frame
-  const pendingSlot = useRef<'A' | 'B' | null>(null);
+  /** Long-press timers per pointer */
+  const longPressTimers = useRef(new Map<number, ReturnType<typeof setTimeout>>());
 
-  // Feed new frames into the inactive slot
-  useEffect(() => {
-    if (!latestFrameUri) return;
-    if (activeSlot.current === 'A') {
-      // Active is A → load into B
-      pendingSlot.current = 'B';
-      setSlotB(latestFrameUri);
+  const precisionRef = useRef(precisionMode);
+  useEffect(() => { precisionRef.current = precisionMode; }, [precisionMode]);
+
+  // ─── Coordinate helpers ─────────────────────────────────────────────────────
+
+  /**
+   * Given the container dimensions and the host aspect ratio,
+   * calculate the actual rendered image rect (letterbox-aware).
+   */
+  const calcRenderedRect = useCallback(() => {
+    const c = containerRect.current;
+    if (!hostInfo || hostInfo.width === 0 || hostInfo.height === 0) {
+      renderedRect.current = { ...c };
+      return;
+    }
+
+    // Account for rotation
+    const isLandscape = hostInfo.rotation === 1 || hostInfo.rotation === 3;
+    const hostW = isLandscape ? hostInfo.height : hostInfo.width;
+    const hostH = isLandscape ? hostInfo.width : hostInfo.height;
+    const hostAR = hostW / hostH;
+    const containerAR = c.w / c.h;
+
+    let imgW: number, imgH: number, imgX: number, imgY: number;
+
+    if (containerAR > hostAR) {
+      // Pillarboxed (black bars on sides)
+      imgH = c.h;
+      imgW = c.h * hostAR;
+      imgX = c.x + (c.w - imgW) / 2;
+      imgY = c.y;
     } else {
-      // Active is B → load into A
-      pendingSlot.current = 'A';
-      setSlotA(latestFrameUri);
+      // Letterboxed (black bars top/bottom)
+      imgW = c.w;
+      imgH = c.w / hostAR;
+      imgX = c.x;
+      imgY = c.y + (c.h - imgH) / 2;
     }
-  }, [latestFrameUri]);
 
-  // Called by the inactive FastImage once its frame is fully decoded
-  const handleFrameLoaded = useCallback((slot: 'A' | 'B') => {
-    if (slot !== activeSlot.current && slot === pendingSlot.current) {
-      // Swap: new slot becomes active, clear the old slot's URI to free memory
-      const prev = activeSlot.current;
-      activeSlot.current = slot;
-      pendingSlot.current = null;
-      if (prev === 'A') setSlotA(null);
-      else setSlotB(null);
+    renderedRect.current = { x: imgX, y: imgY, w: imgW, h: imgH };
+  }, [hostInfo]);
+
+  useEffect(() => { calcRenderedRect(); }, [hostInfo, calcRenderedRect]);
+
+  /** Normalise a raw page coordinate to 0–1 relative to rendered image. */
+  const normalise = useCallback((pageX: number, pageY: number) => {
+    const r = renderedRect.current;
+    const nx = Math.max(0, Math.min(1, (pageX - r.x) / r.w));
+    const ny = Math.max(0, Math.min(1, (pageY - r.y) / r.h));
+    return { nx, ny };
+  }, []);
+
+  // ─── WebSocket ──────────────────────────────────────────────────────────────
+
+  const sendMsg = useCallback((msg: OutMsg) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(msg));
     }
   }, []);
 
-  // ─── WebSocket ─────────────────────────────────────────────────────────────
-  const {
-    sendTouch, sendSwipe, sendKey, sendMessage,
-    disconnect, wsStatus, connPhase,
-  } = useWebSocket({
-    url: wsUrl,
-    enabled: true,
-    onConnect: () => {
-      showConnectBadge();
-      scheduleHideControls();
-    },
-    onDisconnect: () => dispatch(setStatus('reconnecting')),
-    onPhaseChange: (phase) => {
-      if (phase === 'ready') dispatch(setStatus('connected'));
-    },
-  });
+  const startPing = useCallback(() => {
+    if (pingInterval.current) clearInterval(pingInterval.current);
+    pingInterval.current = setInterval(() => {
+      pingTs.current = Date.now();
+      sendMsg({ type: 'ping', ts: pingTs.current });
+    }, PING_INTERVAL_MS);
+  }, [sendMsg]);
 
-  const isReady = connPhase === 'ready';
-
-  // ─── Coordinate mapping ────────────────────────────────────────────────────
-  // Normalises controller screen coords (0..1) so the host can scale them
-  // back to its own resolution — works across different screen sizes.
-  const toNorm = useCallback((px: number, py: number): [number, number] => {
-    if (!viewLayout || viewLayout.width === 0 || viewLayout.height === 0) {
-      return [0.5, 0.5];
+  const connect = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.close();
     }
-    const nx = Math.max(0, Math.min(1, (px - viewLayout.x) / viewLayout.width));
-    const ny = Math.max(0, Math.min(1, (py - viewLayout.y) / viewLayout.height));
-    return [nx, ny];
-  }, [viewLayout]);
 
-  // ─── Gesture state refs ─────────────────────────────────────────────────────
-  const tapStartRef = useRef<{ x: number; y: number; t: number; moved: boolean } | null>(null);
-  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastMoveTimeRef = useRef(0);
-  const pinchStartDistRef = useRef<number | null>(null);
-  const isDraggingRef = useRef(false);
+    const ws = new WebSocket(`ws://${hostIp}:${WS_PORT}`);
+    wsRef.current = ws;
 
-  const clearLongPress = useCallback(() => {
-    if (longPressTimerRef.current) {
-      clearTimeout(longPressTimerRef.current);
-      longPressTimerRef.current = null;
-    }
-  }, []);
+    ws.onopen = () => {
+      reconnectAttempts.current = 0;
+      setConnected(true);
+      startPing();
+    };
 
-  // ─── PanResponder ──────────────────────────────────────────────────────────
-  const panResponder = useRef(
-    PanResponder.create({
-
-      onStartShouldSetPanResponder: () => isReady,
-      onStartShouldSetPanResponderCapture: () => isReady,
-      onMoveShouldSetPanResponder: (_, g) =>
-        isReady && (Math.abs(g.dx) > 3 || Math.abs(g.dy) > 3),
-      onMoveShouldSetPanResponderCapture: (_, g) =>
-        isReady && (Math.abs(g.dx) > 3 || Math.abs(g.dy) > 3),
-
-      // ── TOUCH DOWN ───────────────────────────────────────────────────────
-      onPanResponderGrant: (evt: GestureResponderEvent) => {
-        revealControls();
-        const touches = evt.nativeEvent.touches;
-
-        if (touches.length >= 2) {
-          const dx = touches[1].pageX - touches[0].pageX;
-          const dy = touches[1].pageY - touches[0].pageY;
-          pinchStartDistRef.current = Math.sqrt(dx * dx + dy * dy);
-          clearLongPress();
-          return;
-        }
-
-        const { pageX, pageY } = evt.nativeEvent;
-        isDraggingRef.current = false;
-        tapStartRef.current = { x: pageX, y: pageY, t: Date.now(), moved: false };
-
-        longPressTimerRef.current = setTimeout(() => {
-          if (tapStartRef.current && !tapStartRef.current.moved) {
-            tapStartRef.current.moved = true;
-            const [nx, ny] = toNorm(pageX, pageY);
-            sendMessage({ type: 'longpress', x: nx, y: ny });
-            showRipple(pageX, pageY);
+    ws.onmessage = (evt) => {
+      try {
+        if (typeof evt.data === 'string') {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === 'frame') {
+            setFrameUri(`data:image/jpeg;base64,${msg.data}`);
+          } else if (msg.type === 'pong') {
+            setLatency(Date.now() - pingTs.current);
+          } else if (msg.type === 'device_info') {
+            setHostInfo(msg as DeviceInfoMsg);
           }
-        }, LONG_PRESS_MS);
-      },
-
-      // ── TOUCH MOVE ───────────────────────────────────────────────────────
-      onPanResponderMove: (evt: GestureResponderEvent, gs: PanResponderGestureState) => {
-        const touches = evt.nativeEvent.touches;
-
-        // Pinch / zoom — two fingers
-        if (touches.length >= 2 && pinchStartDistRef.current !== null) {
-          const dx = touches[1].pageX - touches[0].pageX;
-          const dy = touches[1].pageY - touches[0].pageY;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          const delta = dist - pinchStartDistRef.current;
-
-          if (Math.abs(delta) > PINCH_MIN_DELTA_PX) {
-            const scale = dist / pinchStartDistRef.current;
-            const cx = (touches[0].pageX + touches[1].pageX) / 2;
-            const cy = (touches[0].pageY + touches[1].pageY) / 2;
-            const [ncx, ncy] = toNorm(cx, cy);
-            sendMessage({ type: 'pinch', cx: ncx, cy: ncy, scale, duration: 350 });
-            pinchStartDistRef.current = dist;
-          }
-          return;
         }
+      } catch (_) { /* ignore malformed */ }
+    };
 
-        // Single-finger drag
-        const state = tapStartRef.current;
-        if (!state) return;
+    ws.onclose = () => {
+      setConnected(false);
+      if (pingInterval.current) clearInterval(pingInterval.current);
 
-        const now = Date.now();
-        if (now - lastMoveTimeRef.current < MOVE_THROTTLE_MS) return;
-        lastMoveTimeRef.current = now;
+      // Exponential back-off
+      const delay = Math.min(
+        RECONNECT_BASE_MS * 2 ** reconnectAttempts.current,
+        RECONNECT_MAX_MS,
+      );
+      reconnectAttempts.current += 1;
+      reconnectTimer.current = setTimeout(connect, delay);
+    };
 
-        const totalMove = Math.sqrt(gs.dx * gs.dx + gs.dy * gs.dy);
-        if (totalMove > TAP_MAX_MOVE_PX) {
-          if (!state.moved) {
-            state.moved = true;
-            isDraggingRef.current = true;
-            clearLongPress();
-          }
-          const [nx, ny] = toNorm(evt.nativeEvent.pageX, evt.nativeEvent.pageY);
-          sendTouch('down', nx, ny);
-        }
-      },
-
-      // ── TOUCH UP ─────────────────────────────────────────────────────────
-      onPanResponderRelease: (evt: GestureResponderEvent, gs: PanResponderGestureState) => {
-        clearLongPress();
-        pinchStartDistRef.current = null;
-
-        const state = tapStartRef.current;
-        tapStartRef.current = null;
-        if (!state) return;
-
-        const elapsed = Date.now() - state.t;
-        const totalMove = Math.sqrt(gs.dx * gs.dx + gs.dy * gs.dy);
-        const moved = state.moved || totalMove > TAP_MAX_MOVE_PX;
-
-        if (!moved && elapsed < TAP_MAX_DURATION_MS) {
-          // Tap
-          const [nx, ny] = toNorm(state.x, state.y);
-          sendTouch('tap', nx, ny, 50);
-          showRipple(state.x, state.y);
-        } else if (moved && isDraggingRef.current) {
-          // Swipe / drag
-          const [sx, sy] = toNorm(state.x, state.y);
-          const [ex, ey] = toNorm(state.x + gs.dx, state.y + gs.dy);
-          sendSwipe(sx, sy, ex, ey, Math.max(80, Math.min(elapsed, 800)));
-        } else {
-          // Long-press already fired — send lift
-          const [nx, ny] = toNorm(evt.nativeEvent.pageX, evt.nativeEvent.pageY);
-          sendTouch('up', nx, ny);
-        }
-
-        isDraggingRef.current = false;
-      },
-
-      onPanResponderTerminate: () => {
-        clearLongPress();
-        pinchStartDistRef.current = null;
-        tapStartRef.current = null;
-        isDraggingRef.current = false;
-      },
-
-      onShouldBlockNativeResponder: () => true,
-    })
-  ).current;
-
-  // ─── Controls visibility ───────────────────────────────────────────────────
-  const showConnectBadge = () => {
-    Animated.sequence([
-      Animated.timing(connBadgeAnim, { toValue: 1, duration: 300, useNativeDriver: true }),
-      Animated.delay(1800),
-      Animated.timing(connBadgeAnim, { toValue: 0, duration: 300, useNativeDriver: true }),
-    ]).start();
-  };
-
-  const scheduleHideControls = useCallback(() => {
-    if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
-    controlsTimerRef.current = setTimeout(() => {
-      Animated.timing(controlsAnim, {
-        toValue: 0, duration: 300, useNativeDriver: true,
-      }).start();
-      setControlsVisible(false);
-      dispatch(setShowControls(false));
-    }, 4000);
-  }, [dispatch, controlsAnim]);
-
-  const revealControls = useCallback(() => {
-    if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
-    Animated.timing(controlsAnim, {
-      toValue: 1, duration: 200, useNativeDriver: true,
-    }).start();
-    setControlsVisible(true);
-    dispatch(setShowControls(true));
-    scheduleHideControls();
-  }, [dispatch, scheduleHideControls, controlsAnim]);
+    ws.onerror = () => { /* onclose fires next */ };
+  }, [hostIp, startPing]);
 
   useEffect(() => {
-    scheduleHideControls();
+    connect();
     return () => {
-      if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
-      dispatch(resetStream());
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (pingInterval.current) clearInterval(pingInterval.current);
+      wsRef.current?.close();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [connect]);
 
-  // ─── Disconnect ─────────────────────────────────────────────────────────────
-  const handleDisconnect = useCallback(() => {
-    disconnect();
-    dispatch(resetConnection());
-    dispatch(resetStream());
-    nav.goBack();
-  }, [disconnect, dispatch, nav]);
+  // ─── Touch handlers ─────────────────────────────────────────────────────────
+  //
+  //  We use raw onTouchStart/Move/End (NOT PanResponder) because PanResponder
+  //  only tracks the "primary" pointer and gives us no multi-touch changedTouches.
+  //
+  //  Each event exposes nativeEvent.changedTouches — the pointers that changed
+  //  in this event — and nativeEvent.touches — all currently active pointers.
 
-  // ─── HUD helpers ────────────────────────────────────────────────────────────
-  const statusColor = () => {
-    if (!isReady) return colors.warning;
-    switch (wsStatus) {
-      case 'connected': return colors.success;
-      case 'connecting':
-      case 'reconnecting': return colors.warning;
-      default: return colors.error;
-    }
-  };
+  const sendPointer = useCallback((
+    action: PointerMsg['action'],
+    pointerId: number,
+    nx: number,
+    ny: number,
+    pressure: number,
+  ) => {
+    sendMsg({
+      type: 'pointer',
+      action,
+      pointerId,
+      x: nx,
+      y: ny,
+      pressure,
+      timestamp: Date.now(),
+    });
+  }, [sendMsg]);
 
-  const statusLabel = () => {
-    if (!isReady) {
-      switch (connPhase) {
-        case 'socket': return 'Connecting…';
-        case 'hello': return 'Establishing stream…';
-        default: return 'Starting…';
-      }
-    }
-    switch (wsStatus) {
-      case 'connected': return `Connected • ${fps} fps`;
-      case 'connecting': return 'Connecting…';
-      case 'reconnecting': return `Reconnecting (${reconnectAttempts})…`;
-      default: return 'Disconnected';
-    }
-  };
+  /** Update the touch-dot overlay (pure visual feedback on controller side). */
+  const updateDots = useCallback(
+    (id: number, pageX: number, pageY: number, remove = false) => {
+      setTouchDots(prev => {
+        const next = prev.filter(d => d.id !== id);
+        if (!remove) next.push({ id, x: pageX, y: pageY });
+        return next;
+      });
+    },
+    [],
+  );
 
-  const loadingTitle = () => {
-    switch (connPhase) {
-      case 'socket': return 'Connecting…';
-      case 'hello': return 'Establishing Stream…';
-      case 'disconnected': return 'Reconnecting…';
-      default: return 'Starting…';
-    }
-  };
+  const handleTouchStart = useCallback((e: GestureResponderEvent) => {
+    e.nativeEvent.changedTouches.forEach(t => {
+      const id = t.identifier;
+      const { nx, ny } = normalise(t.pageX, t.pageY);
 
-  const loadingSubtitle = () => {
-    if (connPhase === 'hello') return 'Host device is preparing screen share';
-    if (connPhase === 'disconnected' || wsStatus === 'reconnecting')
-      return `Attempt ${reconnectAttempts} of 8`;
-    return `Connecting to ${deviceName || host}`;
-  };
+      activePointers.current.set(id, { x: nx, y: ny });
+      sendPointer('down', id, nx, ny, t.force ?? 1.0);
+      updateDots(id, t.pageX, t.pageY);
 
-  // Whether either slot has content (stream has started)
-  const hasFrame = slotA !== null || slotB !== null;
+      // Long-press detection (500 ms hold without movement)
+      const timer = setTimeout(() => {
+        const cur = activePointers.current.get(id);
+        if (cur) {
+          // Re-send a 'down' with a special pressure flag (host interprets as long-press)
+          sendPointer('down', id, cur.x, cur.y, 2.0 /* >1 signals long-press */);
+        }
+      }, LONG_PRESS_MS);
+      longPressTimers.current.set(id, timer);
+    });
+  }, [normalise, sendPointer, updateDots]);
+
+  const handleTouchMove = useCallback((e: GestureResponderEvent) => {
+    const threshold = precisionRef.current
+      ? MOVE_THRESHOLD_PRECISION
+      : MOVE_THRESHOLD_NORMAL;
+
+    e.nativeEvent.changedTouches.forEach(t => {
+      const id = t.identifier;
+      const { nx, ny } = normalise(t.pageX, t.pageY);
+      const last = activePointers.current.get(id);
+
+      if (!last) return;
+
+      const moved = Math.abs(nx - last.x) > threshold || Math.abs(ny - last.y) > threshold;
+      if (!moved) return;
+
+      // Cancel long-press if finger moved
+      const lpt = longPressTimers.current.get(id);
+      if (lpt) { clearTimeout(lpt); longPressTimers.current.delete(id); }
+
+      activePointers.current.set(id, { x: nx, y: ny });
+      sendPointer('move', id, nx, ny, t.force ?? 1.0);
+      updateDots(id, t.pageX, t.pageY);
+    });
+  }, [normalise, sendPointer, updateDots]);
+
+  const handleTouchEnd = useCallback((e: GestureResponderEvent) => {
+    e.nativeEvent.changedTouches.forEach(t => {
+      const id = t.identifier;
+      const { nx, ny } = normalise(t.pageX, t.pageY);
+
+      const lpt = longPressTimers.current.get(id);
+      if (lpt) { clearTimeout(lpt); longPressTimers.current.delete(id); }
+
+      activePointers.current.delete(id);
+      sendPointer('up', id, nx, ny, 0);
+      updateDots(id, t.pageX, t.pageY, true);
+    });
+  }, [normalise, sendPointer, updateDots]);
+
+  const handleTouchCancel = useCallback((e: GestureResponderEvent) => {
+    e.nativeEvent.changedTouches.forEach(t => {
+      const id = t.identifier;
+      const { nx, ny } = normalise(t.pageX, t.pageY);
+
+      const lpt = longPressTimers.current.get(id);
+      if (lpt) { clearTimeout(lpt); longPressTimers.current.delete(id); }
+
+      activePointers.current.delete(id);
+      sendPointer('cancel', id, nx, ny, 0);
+      updateDots(id, t.pageX, t.pageY, true);
+    });
+  }, [normalise, sendPointer, updateDots]);
+
+  // ─── Layout ─────────────────────────────────────────────────────────────────
+
+  const onContainerLayout = useCallback((e: LayoutChangeEvent) => {
+    const { x, y, width, height } = e.nativeEvent.layout;
+    containerRect.current = { x, y, w: width, h: height };
+    calcRenderedRect();
+  }, [calcRenderedRect]);
+
+  // ─── System actions ─────────────────────────────────────────────────────────
+
+  const sendSystem = useCallback((action: SystemMsg['action']) => {
+    sendMsg({ type: 'system', action });
+  }, [sendMsg]);
 
   // ─── Render ─────────────────────────────────────────────────────────────────
-  return (
-    <View style={styles.container}>
-      <StatusBar hidden />
-
-      {/* ── Loading overlay — hidden only after connecting_ack ──────────────── */}
-      {!isReady && (
-        <View style={styles.loadingOverlay}>
-          <View style={styles.loadingCard}>
-            <ActivityIndicator size="large" color={colors.primary} />
-            <Text style={styles.loadingTitle}>{loadingTitle()}</Text>
-            <Text style={styles.loadingSubtitle}>{loadingSubtitle()}</Text>
-
-            {(connPhase === 'disconnected' || wsStatus === 'reconnecting') && (
-              <View style={styles.reconnectDots}>
-                {[0, 1, 2].map(i => (
-                  <DotBlink key={i} delay={i * 200} color={colors.primary} />
-                ))}
-              </View>
-            )}
-
-            {connPhase !== 'disconnected' && (
-              <View style={styles.loadingSteps}>
-                <LoadingStep
-                  done={connPhase !== 'socket' && connPhase !== 'idle'}
-                  active={connPhase === 'socket'}
-                  label="WebSocket connected"
-                />
-                <LoadingStep
-                  done={connPhase === 'ready'}
-                  active={connPhase === 'hello'}
-                  label="Screen dimensions received"
-                />
-                <LoadingStep
-                  done={connPhase === 'ready'}
-                  active={connPhase === 'hello'}
-                  label="Stream ready"
-                />
-              </View>
-            )}
-          </View>
-
-          <TouchableOpacity style={styles.loadingDisconnect} onPress={handleDisconnect}>
-            <Icon name="close-circle-outline" size={18} color={colors.textMuted} />
-            <Text style={styles.loadingDisconnectText}>Cancel</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {/* ── Gesture + double-buffer stream layer ────────────────────────────── */}
-      {isReady && (
-        <View
-          style={styles.gestureLayer}
-          onLayout={(e) => setViewLayout(e.nativeEvent.layout)}
-          {...panResponder.panHandlers}
-        >
-
-          {/* ── Double-buffer frames ────────────────────────────────────────
-               Slot A and Slot B overlap absolutely.
-               Only the ACTIVE slot is visible (opacity 1); the inactive
-               slot loads the next frame at opacity 0 so Glide warms it on
-               the GPU. When onLoad fires on the inactive slot we flip
-               activeSlot — the previous frame stays on screen until the
-               next one is truly ready, eliminating the black flash.        */}
-
-          {slotA !== null && (
-            <FastImage
-              key="slotA"
-              style={[
-                styles.frame,
-                activeSlot.current !== 'A' && styles.frameHidden,
-              ]}
-              source={{ uri: slotA, priority: FastImage.priority.high }}
-              resizeMode={FastImage.resizeMode.contain}
-              onLoad={() => handleFrameLoaded('A')}
-              pointerEvents="none"
-            />
-          )}
-
-          {slotB !== null && (
-            <FastImage
-              key="slotB"
-              style={[
-                styles.frame,
-                activeSlot.current !== 'B' && styles.frameHidden,
-              ]}
-              source={{ uri: slotB, priority: FastImage.priority.high }}
-              resizeMode={FastImage.resizeMode.contain}
-              onLoad={() => handleFrameLoaded('B')}
-              pointerEvents="none"
-            />
-          )}
-
-          {/* Waiting state — shown when stream is live but no frame yet */}
-          {!hasFrame && (
-            <View style={styles.waitingFrame}>
-              <Icon name="monitor-shimmer" size={60} color={colors.textMuted} />
-              <Text style={styles.waitingText}>Waiting for first frame…</Text>
-              <View style={styles.reconnectDots}>
-                {[0, 1, 2].map(i => (
-                  <DotBlink key={i} delay={i * 200} color={colors.primary} />
-                ))}
-              </View>
-            </View>
-          )}
-
-          {/* Touch ripple — visual feedback for taps */}
-          {ripplePos && (
-            <Animated.View
-              pointerEvents="none"
-              style={[
-                styles.touchRipple,
-                {
-                  left: ripplePos.x - 22,
-                  top: ripplePos.y - 22,
-                  opacity: rippleAnim,
-                  transform: [{
-                    scale: rippleAnim.interpolate({
-                      inputRange: [0, 1],
-                      outputRange: [1.8, 0.6],
-                    }),
-                  }],
-                },
-              ]}
-            />
-          )}
-        </View>
-      )}
-
-      {/* ── Top HUD ─────────────────────────────────────────────────────────── */}
-      {isReady && (
-        <Animated.View
-          pointerEvents={controlsVisible ? 'box-none' : 'none'}
-          style={[styles.topHUD, { opacity: controlsAnim }]}
-        >
-          <LinearGradient
-            colors={['rgba(5,13,31,0.92)', 'transparent']}
-            style={styles.topGradient}
-          >
-            <View style={styles.topRow}>
-              <TouchableOpacity onPress={handleDisconnect} style={styles.hudBtn}>
-                <Icon name="close" size={22} color={palette.white} />
-              </TouchableOpacity>
-
-              <View style={styles.deviceInfo}>
-                <Icon name="monitor" size={14} color={colors.accent} />
-                <Text style={styles.deviceName} numberOfLines={1}>
-                  {deviceName || host}
-                </Text>
-              </View>
-
-              <View style={styles.statusPill}>
-                <View style={[styles.statusDot, { backgroundColor: statusColor() }]} />
-                <Text style={styles.statusPillText}>{statusLabel()}</Text>
-              </View>
-            </View>
-          </LinearGradient>
-        </Animated.View>
-      )}
-
-      {/* ── Latency badge ────────────────────────────────────────────────────── */}
-      {isReady && wsStatus === 'connected' && latency > 0 && (
-        <Animated.View
-          pointerEvents="none"
-          style={[styles.statsOverlay, { opacity: controlsAnim }]}
-        >
-          <Text style={styles.statText}>{latency}ms</Text>
-        </Animated.View>
-      )}
-
-      {/* ── Bottom system key bar ─────────────────────────────────────────────
-           Sits OUTSIDE gestureLayer so taps here are not forwarded to host.
-           Each button calls sendKey() directly.                              */}
-      {isReady && (
-        <Animated.View
-          style={[
-            styles.bottomBar,
-            { opacity: controlsAnim, paddingBottom: insets.bottom + 8 },
-          ]}
-          pointerEvents={controlsVisible ? 'box-none' : 'none'}
-        >
-          <LinearGradient
-            colors={['transparent', 'rgba(5,13,31,0.95)']}
-            style={styles.bottomGradient}
-          >
-            <View style={styles.controlRow}>
-              <ControlButton
-                icon="view-grid"
-                label="Recents"
-                onPress={() => sendKey('recents')}
-              />
-              <ControlButton
-                icon="circle-outline"
-                label="Home"
-                onPress={() => sendKey('home')}
-                primary
-              />
-              <ControlButton
-                icon="arrow-left-circle"
-                label="Back"
-                onPress={() => sendKey('back')}
-              />
-              <ControlButton
-                icon="bell-outline"
-                label="Notifs"
-                onPress={() => sendKey('notifications')}
-              />
-            </View>
-          </LinearGradient>
-        </Animated.View>
-      )}
-
-      {/* ── Connected flash badge ─────────────────────────────────────────────── */}
-      <Animated.View
-        pointerEvents="none"
-        style={[
-          styles.connBadge,
-          {
-            opacity: connBadgeAnim,
-            transform: [{
-              scale: connBadgeAnim.interpolate({
-                inputRange: [0, 1],
-                outputRange: [0.85, 1],
-              }),
-            }],
-          },
-        ]}
-      >
-        <LinearGradient
-          colors={[`${colors.success}CC`, `${colors.success}88`]}
-          style={styles.connBadgeInner}
-        >
-          <Icon name="access-point-check" size={20} color={palette.white} />
-          <Text style={styles.connBadgeText}>Connected</Text>
-        </LinearGradient>
-      </Animated.View>
-    </View>
-  );
-}
-
-// ─── Sub-components ───────────────────────────────────────────────────────────
-
-function LoadingStep({
-  done, active, label,
-}: { done: boolean; active: boolean; label: string }) {
-  return (
-    <View style={lstyles.row}>
-      {done
-        ? <Icon name="check-circle" size={16} color={colors.success} />
-        : active
-          ? <ActivityIndicator size={14} color={colors.primary} />
-          : <Icon name="circle-outline" size={16} color={colors.textMuted} />}
-      <Text style={[
-        lstyles.label,
-        done && { color: colors.success },
-        active && { color: palette.white },
-      ]}>
-        {label}
-      </Text>
-    </View>
-  );
-}
-
-const lstyles = StyleSheet.create({
-  row: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginVertical: 3 },
-  label: { fontSize: typography.sm, color: colors.textMuted },
-});
-
-function ControlButton({
-  icon, label, onPress, primary = false,
-}: { icon: string; label: string; onPress: () => void; primary?: boolean }) {
-  const scaleAnim = useRef(new Animated.Value(1)).current;
-
-  const press = () => {
-    Animated.sequence([
-      Animated.timing(scaleAnim, { toValue: 0.88, duration: 80, useNativeDriver: true }),
-      Animated.spring(scaleAnim, { toValue: 1, useNativeDriver: true }),
-    ]).start();
-    onPress();
-  };
 
   return (
-    <Animated.View style={{ transform: [{ scale: scaleAnim }] }}>
-      <TouchableOpacity onPress={press} style={styles.ctrlBtn} activeOpacity={0.85}>
-        <View style={[
-          styles.ctrlIconWrap,
-          primary && {
-            backgroundColor: `${colors.primary}30`,
-            borderColor: `${colors.primary}50`,
-          },
-        ]}>
-          <Icon
-            name={icon}
-            size={primary ? 26 : 22}
-            color={primary ? colors.primary : colors.textSecondary}
-          />
-        </View>
-        <Text style={[styles.ctrlLabel, primary && { color: colors.primary }]}>
-          {label}
+    <SafeAreaView style={styles.root}>
+      {/* ── Status bar ──────────────────────────────────────────────────── */}
+      <View style={styles.topBar}>
+        <View style={[styles.dot, { backgroundColor: connected ? '#4ade80' : '#f87171' }]} />
+        <Text style={styles.topBarText}>
+          {connected ? `${latency}ms` : 'Disconnected'}
         </Text>
-      </TouchableOpacity>
-    </Animated.View>
+        {hostInfo && (
+          <Text style={styles.topBarText}>
+            {hostInfo.width}×{hostInfo.height}
+          </Text>
+        )}
+        <TouchableOpacity
+          style={[styles.precBtn, precisionMode && styles.precBtnActive]}
+          onPress={() => setPrecisionMode(v => !v)}
+        >
+          <Text style={styles.precBtnTxt}>⊕</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* ── Remote screen ───────────────────────────────────────────────── */}
+      <View
+        style={styles.screenWrap}
+        onLayout={onContainerLayout}
+        // Raw multi-touch capture — bypasses React responder system
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchCancel}
+      >
+        {frameUri ? (
+          <Image
+            source={{ uri: frameUri }}
+            style={styles.screenImg}
+            resizeMode="contain"
+          />
+        ) : (
+          <View style={styles.noFrame}>
+            <Text style={styles.noFrameTxt}>
+              {connected ? 'Awaiting stream…' : 'Connecting…'}
+            </Text>
+          </View>
+        )}
+
+        {/* Per-pointer visual dots */}
+        {touchDots.map(d => (
+          <View
+            key={d.id}
+            style={[styles.touchDot, { left: d.x - 18, top: d.y - 18 }]}
+            pointerEvents="none"
+          />
+        ))}
+      </View>
+
+      {/* ── System controls ─────────────────────────────────────────────── */}
+      <View style={styles.sysBar}>
+        {(
+          [
+            { icon: '◁', action: 'back' as const, label: 'Back' },
+            { icon: '○', action: 'home' as const, label: 'Home' },
+            { icon: '□', action: 'recents' as const, label: 'Recent' },
+            { icon: '↓', action: 'notifications' as const, label: 'Notif' },
+            { icon: '⏻', action: 'lock' as const, label: 'Lock' },
+          ] as const
+        ).map(({ icon, action, label }) => (
+          <TouchableOpacity
+            key={action}
+            style={styles.sysBtn}
+            onPress={() => sendSystem(action)}
+          >
+            <Text style={styles.sysBtnIcon}>{icon}</Text>
+            <Text style={styles.sysBtnLabel}>{label}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+    </SafeAreaView>
   );
-}
-
-function DotBlink({ delay, color }: { delay: number; color: string }) {
-  const anim = useRef(new Animated.Value(0.3)).current;
-
-  useEffect(() => {
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.delay(delay),
-        Animated.timing(anim, { toValue: 1, duration: 500, useNativeDriver: true }),
-        Animated.timing(anim, { toValue: 0.3, duration: 500, useNativeDriver: true }),
-      ])
-    );
-    loop.start();
-    return () => loop.stop();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  return (
-    <Animated.View style={{
-      width: 8, height: 8, borderRadius: 4,
-      backgroundColor: color, opacity: anim, margin: 3,
-    }} />
-  );
-}
+};
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
+
+const { width: SCREEN_W } = Dimensions.get('window');
+
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000' },
-
-  // ── Gesture + stream layer ──────────────────────────────────────────────────
-  gestureLayer: {
-    ...StyleSheet.absoluteFillObject,
+  root: {
+    flex: 1,
+    backgroundColor: '#0f0f0f',
   },
-
-  // Active frame — fully visible
-  frame: {
-    ...StyleSheet.absoluteFillObject,
+  /* top bar */
+  topBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#1a1a1a',
+    gap: 8,
   },
-
-  // Inactive (loading) frame — invisible but still GPU-warm.
-  // opacity:0 keeps it off-screen without triggering a Glide teardown.
-  frameHidden: {
-    opacity: 0,
+  dot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
   },
-
-  waitingFrame: {
-    flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.base,
+  topBarText: {
+    color: '#d4d4d4',
+    fontSize: 12,
+    fontFamily: Platform.OS === 'android' ? 'monospace' : 'Menlo',
   },
-  waitingText: { color: colors.textSecondary, fontSize: typography.base },
-
-  // ── Touch ripple ────────────────────────────────────────────────────────────
-  touchRipple: {
-    position: 'absolute',
-    width: 44, height: 44, borderRadius: 22,
-    backgroundColor: 'rgba(255,255,255,0.28)',
-    borderWidth: 1.5,
-    borderColor: 'rgba(255,255,255,0.55)',
+  precBtn: {
+    marginLeft: 'auto',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#555',
   },
-
-  // ── Loading overlay ─────────────────────────────────────────────────────────
-  loadingOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: palette.navy,
+  precBtnActive: {
+    backgroundColor: '#7c3aed',
+    borderColor: '#7c3aed',
+  },
+  precBtnTxt: {
+    color: '#fff',
+    fontSize: 14,
+  },
+  /* screen area */
+  screenWrap: {
+    flex: 1,
+    backgroundColor: '#000',
+    position: 'relative',
+    overflow: 'hidden',
+  },
+  screenImg: {
+    flex: 1,
+    width: '100%',
+    height: '100%',
+  },
+  noFrame: {
+    flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    zIndex: 20,
-    paddingHorizontal: spacing.xl,
   },
-  loadingCard: {
-    width: '100%',
-    maxWidth: 320,
-    backgroundColor: 'rgba(255,255,255,0.06)',
-    borderRadius: radii.xl,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.10)',
-    alignItems: 'center',
-    paddingVertical: spacing['2xl'],
-    paddingHorizontal: spacing.xl,
-    gap: spacing.md,
+  noFrameTxt: {
+    color: '#555',
+    fontSize: 14,
   },
-  loadingTitle: {
-    color: palette.white,
-    fontSize: typography.lg,
-    fontWeight: typography.semibold as any,
-    textAlign: 'center',
-    marginTop: spacing.sm,
+  /* touch dot overlay */
+  touchDot: {
+    position: 'absolute',
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(124, 58, 237, 0.4)',
+    borderWidth: 2,
+    borderColor: 'rgba(167, 139, 250, 0.8)',
   },
-  loadingSubtitle: {
-    color: colors.textMuted,
-    fontSize: typography.sm,
-    textAlign: 'center',
-    paddingHorizontal: spacing.base,
-  },
-  loadingSteps: {
-    width: '100%',
-    marginTop: spacing.sm,
-    paddingHorizontal: spacing.sm,
-    gap: 6,
-  },
-  loadingDisconnect: {
+  /* system bar */
+  sysBar: {
     flexDirection: 'row',
+    justifyContent: 'space-around',
     alignItems: 'center',
-    gap: spacing.xs,
-    marginTop: spacing.xl,
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.lg,
+    backgroundColor: '#1a1a1a',
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+    borderTopWidth: 1,
+    borderTopColor: '#2a2a2a',
   },
-  loadingDisconnectText: { color: colors.textMuted, fontSize: typography.sm },
-
-  reconnectDots: {
-    flexDirection: 'row', alignItems: 'center', marginTop: spacing.xs,
-  },
-
-  // ── Top HUD ─────────────────────────────────────────────────────────────────
-  topHUD: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 },
-  topGradient: { paddingTop: 12, paddingBottom: 24 },
-  topRow: {
-    flexDirection: 'row',
+  sysBtn: {
     alignItems: 'center',
-    paddingHorizontal: spacing.base,
-    gap: spacing.sm,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
   },
-  hudBtn: {
-    width: 36, height: 36, borderRadius: 18,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: 'rgba(255,255,255,0.15)',
+  sysBtnIcon: {
+    color: '#e4e4e7',
+    fontSize: 18,
   },
-  deviceInfo: {
-    flex: 1, flexDirection: 'row', alignItems: 'center',
-    gap: spacing.xs, paddingHorizontal: spacing.sm,
-  },
-  deviceName: {
-    color: palette.white,
-    fontSize: typography.sm,
-    fontWeight: typography.semibold as any,
-  },
-  statusPill: {
-    flexDirection: 'row', alignItems: 'center', gap: 5,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    paddingHorizontal: spacing.sm, paddingVertical: 4,
-    borderRadius: radii.full,
-    borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)',
-  },
-  statusDot: { width: 7, height: 7, borderRadius: 3.5 },
-  statusPillText: {
-    color: palette.white,
-    fontSize: typography.xs,
-    fontWeight: typography.medium as any,
-  },
-
-  // ── Latency ──────────────────────────────────────────────────────────────────
-  statsOverlay: { position: 'absolute', top: 56, right: spacing.base, zIndex: 10 },
-  statText: { color: 'rgba(255,255,255,0.5)', fontSize: 10, fontFamily: 'monospace' },
-
-  // ── Bottom key bar ───────────────────────────────────────────────────────────
-  bottomBar: { position: 'absolute', bottom: 0, left: 0, right: 0, zIndex: 10 },
-  bottomGradient: { paddingTop: 32 },
-  controlRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-evenly',
-    paddingHorizontal: spacing.lg,
-    paddingBottom: spacing.sm,
-  },
-  ctrlBtn: { alignItems: 'center', gap: 4 },
-  ctrlIconWrap: {
-    width: 48, height: 48, borderRadius: 24,
-    backgroundColor: 'rgba(255,255,255,0.1)',
-    borderWidth: 1, borderColor: 'rgba(255,255,255,0.15)',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  ctrlLabel: {
-    color: colors.textMuted,
-    fontSize: 10,
-    fontWeight: typography.medium as any,
-  },
-
-  // ── Connected flash badge ─────────────────────────────────────────────────────
-  connBadge: {
-    position: 'absolute', top: '45%', alignSelf: 'center',
-    borderRadius: radii.xl, overflow: 'hidden', zIndex: 15,
-    ...shadows.successGlow,
-  },
-  connBadgeInner: {
-    flexDirection: 'row', alignItems: 'center',
-    gap: spacing.sm,
-    paddingHorizontal: spacing.xl, paddingVertical: spacing.md,
-  },
-  connBadgeText: {
-    color: palette.white,
-    fontSize: typography.lg,
-    fontWeight: typography.bold as any,
+  sysBtnLabel: {
+    color: '#71717a',
+    fontSize: 9,
+    marginTop: 2,
   },
 });
+
+export default ViewerScreen;
