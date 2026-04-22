@@ -82,8 +82,11 @@ export default function HomeScreen() {
           {/* Header */}
           <View style={styles.header}>
             <View style={styles.logoWrap}>
-              <Icon name="medical-bag" size={28} color={colors.accent} />
+              <TouchableOpacity               onPress={() => { nav.navigate('PatientScreen'); }}>
+                <Icon name="medical-bag" size={28} color={colors.accent} />
+              </TouchableOpacity>
             </View>
+
             <View style={styles.titleWrap}>
               <Text style={styles.appName}>MediMirror</Text>
               <Text style={styles.appTagline}>Clinical Screen Sharing</Text>

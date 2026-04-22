@@ -10,6 +10,8 @@ import SharingScreen from '../screens/SharingScreen';
 import ControlScreen from '../screens/ControlScreen';
 import ViewerScreen from '../screens/ViewerScreen';
 import DiscoveryScreen from '../screens/DiscoveryScreen';
+import PatientScreen from '../vrEye/screens/PatientScreen';
+import RoleAndConnectScreen from '../vrEye/screens/RoleAndConnectScreen';
 
 export type RootStackParamList = {
   Home: undefined;
@@ -55,13 +57,15 @@ export default function AppNavigator() {
         translucent={false}
       />
       <Stack.Navigator
-        initialRouteName="Home"
+        initialRouteName="RoleAndConnectScreen"
         screenOptions={screenOptions}>
         <Stack.Screen name="Home" component={HomeScreen} />
         <Stack.Screen name="Sharing" component={SharingScreen} />
         <Stack.Screen name="Control" component={ControlScreen} />
         <Stack.Screen name="Viewer" component={ViewerScreen} />
         <Stack.Screen name="Discovery" component={DiscoveryScreen} />
+        <Stack.Screen name="PatientScreen" component={PatientScreen} />
+        <Stack.Screen name="RoleAndConnectScreen" component={RoleAndConnectScreen} />
       </Stack.Navigator>
     </NavigationContainer>
   );
